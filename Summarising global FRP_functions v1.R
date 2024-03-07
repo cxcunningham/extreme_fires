@@ -25,7 +25,7 @@ read_summarised_frp <- function(fileList, n = 10000){
     print(i)
     
     # load the summarised data for a given year
-    dat <- readRDS(i) 
+    dat <- readRDS(i)[[1]] 
     
     # how many events?
     n_events <- c(n_events, nrow(dat))
@@ -59,8 +59,25 @@ read_summarised_frp <- function(fileList, n = 10000){
   return(list(largest_events_dn = largest_events_dn, largest_events = largest_events, n_events = n_events, n_hotspots_total = n_hotspots_total, frp_sum_vec = frp_sum_vec))
 }
 
+# function to read a summary of duplicated hotspots
+read_duplicate_summary <- function(fileList) {
+  summaryList <- list()
+  for(i in unique(fileList)) {
+    print(i)
+    summaryList[[i]] <- readRDS(i)[[2]] 
+  }
+  return(bind_rows(summaryList))
+}
 
-
+# function to read a duplicated hotspots for subsequent mapping
+map_duplicate_locations <- function(fileList) {
+  summaryList <- list()
+  for(i in unique(fileList)) {
+    print(i)
+    summaryList[[i]] <- readRDS(i)$duplicates
+  }
+  return(bind_rows(summaryList))
+}
 
 # predict trend line and 95% CI from model
 predict_fun <- function(mod, dat, logBackTrans = T) {
