@@ -7,7 +7,7 @@
 # The key sections of the analysis are as follows:
 
 # 1. Create global lattice
-# 2. Load and summarise hotspots each day
+# 2. Load and summarise hotspots each day (including identifying and omitting likely duplicates)
 # 3. Read summarised data of FRP_sum
 # 4. Load biome spatial data
 # 5. Ratio of extreme events in continents, biogeographical realms, and biomes
