@@ -2,7 +2,7 @@
 
 # Code for the analysis of energetically extreme wildfire events
 # Calum X. Cunningham, University of Tasmania
-# 22 Jan 2024
+# 7 March 2024
 
 # The key sections of the analysis are as follows:
 
@@ -16,7 +16,7 @@
 
 # load packages
 #devtools::install_github("hypertidy/L3bin")
-pacman::p_load(L3bin, sf, units, dplyr,lubridate, ggplot2, cowplot, rnaturalearth, tidyverse, mgcv, ggh4x, ggsci)
+pacman::p_load(L3bin, sf, units, dplyr,lubridate, ggplot2, cowplot, rnaturalearth, tidyverse, mgcv, ggh4x, ggsci, hashr, terra, viridis)
 
 # source custom functions to help with organising data, predicting from models, graphing 
 source("C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/Global FRP/Analysis/Summarising global FRP_functions v1.R")
@@ -93,16 +93,89 @@ listOfFiles <- data.frame(fileName = list.files()) %>%
   mutate(year = substr(fileName, 9, 12),
          month = substr(fileName, 13, 14))
 
+# function to identify likely duplicated hotspots (as a result of slightly overlapping satellite overpasses, especially poles)
+remove_duplicates_fun <- function(file, conf_threshold = 30) {
+  
+  # Make a list to store the corrected output
+  out <- list()
+  idx <- 1
+  
+  # Process each satellite and day/night separately
+  for(sat_x in c("T","A")){
+    for(day_x in c("D","N")){
+      
+      # Filter satellite and day/night and confidence, and type == fire (0)
+      filex <- filter(file, sat == sat_x, dn == day_x, conf >= conf_threshold, type == 0)
+      
+      # If eg. Aqua satellite is missing, skip to next
+      if(nrow(filex)==0){next}
+      
+      # Convert hotspot subset to vector
+      pts <- vect(filex,geom=c("lon","lat"),crs=crs("epsg:4326"),keepgeom=TRUE)
+      
+      # Project to equal area grid
+      pts <- project(pts,crs("epsg:6933"))
+      
+      # Extract grid coordinates
+      pts$x <- geom(pts)[,3]
+      pts$y <- geom(pts)[,4]
+      
+      # Round coordinates to 500m
+      pts$x <- floor(((pts$x+250)/500))*500
+      pts$y <- floor(((pts$y+250)/500))*500
+      
+      # Generate hash from pair of coordinates as a unique index
+      pts$hx <- hash(paste0(pts$x,pts$y))
+      
+      # Convert back to non-geographic data frame
+      pts <- as.data.frame(pts)
+      
+      # Within groups of date and unique geo ID, add an index of duplicated rows
+      ptsg <- pts %>% group_by(hx,YYYYMMDD) %>% mutate(gid = row_number())
+      
+      # Add to our output table
+      out[[idx]]<-ptsg
+      idx=idx+1
+    }
+  }
+  
+  # Merge all satellites/day-night into a single table and count how many duplicates, if any
+  out_df <- bind_rows(out) %>% group_by(hx) %>% mutate(n_hs = length(unique(gid)))
+  
+  # report how many duplicates (values >= 2)
+  print(paste(sum(out_df$gid != 1), "of", nrow(out_df), "are likely duplicates"))
+  
+  # randomly select one hotspot from each collection of duplicates
+  set.seed(123)
+  out_df_dup <- out_df %>% 
+    filter(n_hs != 1) %>% 
+    group_by(hx) %>% 
+    slice(., sample(1:n())) %>% # randomise order (and therefore which observation will be selected)
+    slice_head(n = 1) %>% # select one hotspot
+    mutate(wasduplicated = "y")
+  
+  # join non-duplicates with randomly selected hotspots
+  out_df1 <- out_df %>% 
+    filter(n_hs == 1) %>%
+    bind_rows(out_df_dup)
+  
+  # summarise frequency of duplicates
+  summarisedFreq <- out_df1 %>% ungroup() %>% count(n_hs) 
+  
+  return(list(duplicates_removed = out_df1,
+              summary_of_duplicates = summarisedFreq))
+}
+
 # function to loop through each year, summarise various metrics, and then save yearly summary file
 # satellite = Aqua (A) and/or Terra (T)
 # conf_threshold sets the threshold for the confidence that a hotspots was caused by a fire 
-summarise_hotspots_annually <- function(fileList = listOfFiles, yearRange = 2001:2022, 
+summarise_hotspots_annually <- function(fileList = listOfFiles, yearRange = 2001:2023, 
                                         satellite = c("A", "T"), conf_threshold = 30, outFolder) {
 
   # select years of interest
   listOfFiles1 <- listOfFiles %>% filter(year %in% yearRange)
   
-  # append the 12 months of each year, separately for each year to keep file sizes tractable
+  # join the 12 months of each year, separately for each year to keep file sizes tractable
   for(i in unique(listOfFiles1$year)){
     print(paste("year", i))
     
@@ -116,8 +189,7 @@ summarise_hotspots_annually <- function(fileList = listOfFiles, yearRange = 2001
       # load each csv file in a given year
       dat <- read.csv(paste(listOfFiles2[j,]$fileName, listOfFiles2[j,]$fileName, sep = "/"), sep = "") %>%
         # all values of "sat" in 2001 are "T", so R was reading it as TRUE, so modifying back to character "T"
-        mutate(sat = ifelse(sat == T, "T", sat)) %>%
-        st_as_sf(coords = c("lon", "lat"), crs = st_crs(4326)) %>%
+        mutate(sat = ifelse(sat == T, "T", sat)) %>%  
         # select "fire" hotspots; thus, omit hotspots that the algorithm flagged as likely being from other sources i.e. exclude volcanoes, other static sources, or offshore (e.g. industrial).
         filter(type == 0) %>%
         # omit hotspots with "low" confidence (described as <30% :  https://modis-fire.umd.edu/files/MODIS_C6_C6.1_Fire_User_Guide_1.0.pdf)
@@ -125,14 +197,18 @@ summarise_hotspots_annually <- function(fileList = listOfFiles, yearRange = 2001
         # add Date
         mutate(date_ = as.Date(paste(substr(YYYYMMDD, 1, 4), substr(YYYYMMDD, 5, 6), substr(YYYYMMDD, 7, 8), sep = "-"))) %>%
         # filter for satellite(s) of interest
-        filter(sat %in% satellite) %>%
-        dplyr::select(date_, dn, FRP) 
+        filter(sat %in% satellite) 
 
       yearlyFile <- bind_rows(yearlyFile, dat)
     }
     
+    # scan for duplicate hotspots. In cases where likely duplicates identified, select one randomly.
+    yearlyFile1 <- remove_duplicates_fun(yearlyFile) 
+    
     # summarise daily FRP sum separately for day and night 
-    yearlySummary <- yearlyFile %>%
+    yearlySummary <- yearlyFile1$duplicates_removed %>%
+      st_as_sf(coords = c("lon", "lat"), crs = st_crs(4326)) %>%
+      dplyr::select(date_, dn, FRP)  %>%
       # add spatial grid cell ID by joining with the grid
       st_join(gridTemplate) %>%
       data.frame() %>% 
@@ -143,13 +219,18 @@ summarise_hotspots_annually <- function(fileList = listOfFiles, yearRange = 2001
                 n = n()) 
     
     # save each yearly file
-    saveRDS(yearlySummary, paste("C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/MODIS_global/", outFolder, "/FRP_daily_", i, ".rds", sep = ""))
+    saveRDS(
+      list(events = yearlySummary, 
+           duplicate_summary = yearlyFile1$summary_of_duplicates %>% mutate(year = i),
+           duplicates = yearlyFile1$duplicates_removed %>% filter(wasduplicated == "y")), 
+      paste("C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/MODIS_global/", outFolder, "/FRP_daily_", i, ".rds", sep = ""))
   }
 }
 
 # calculate day and night FRP_sum for each day, and save one output file for each year. Repeating for Terra, and Terra + Aqua satellites
-#summarise_hotspots_annually(yearRange = 2001:2023, satellite = c("T"), outFolder = "hotspotFRPSum_20240116_TERRAonly")
-#summarise_hotspots_annually(yearRange = 2001:2023, satellite = c("A", "T"), outFolder = "hotspotFRPSum_20240116_TERRAandAQUA")
+#summarise_hotspots_annually(yearRange = 2003:2023, satellite = c("A", "T"), outFolder = "hotspotFRPSum_20240229_TERRAandAQUA")
+#summarise_hotspots_annually(yearRange = 2001:2023, satellite = c("T"), outFolder = "hotspotFRPSum_20240229_TERRA")
+#summarise_hotspots_annually(yearRange = 2003:2023, satellite = c("A"), outFolder = "hotspotFRPSum_20240229_AQUA")
 
 
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### 
@@ -157,17 +238,30 @@ summarise_hotspots_annually <- function(fileList = listOfFiles, yearRange = 2001
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### 
 
 # data is stored in yearly RDS files; retrieve file names
-wd_1 <- "C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/MODIS_global/hotspotFRPSum_20240116_TERRAonly"; setwd(wd_1)
+wd_1 <- "C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/MODIS_global/hotspotFRPSum_20240229_TERRAandAQUA"; setwd(wd_1)
 frpsum_list <- list.files(pattern = "rds")
+# but drop 2001 and 2002 because of unequal sampling effort
+frpsum_list <- frpsum_list[!frpsum_list %in% c("FRP_daily_2001.rds", "FRP_daily_2002.rds")]
 
 # read a reduced version without the really small events (to save memory)
 FRP_sum <- read_summarised_frp(fileList = frpsum_list, n = 100000)
 
-# report how many "events"?
-sum(FRP_sum$n_events)
+# Report some sample sizes
+sum(FRP_sum$n_events) # how many "events"?
+sum(FRP_sum$n_hotspots_total) # report how many hotspots used to create those events? 
 
-# report how many hotspots used to create those events? 
-sum(FRP_sum$n_hotspots_total)
+# read summary of duplicates and report how many (and what proportion of) events associated with a duplication
+duplicate_summary <- read_duplicate_summary(frpsum_list) %>% group_by(n_hs) %>% summarise(n = sum(n)) 
+duplicate_summary %>% filter(n_hs != 1) %>% summarise(n = sum(n)) 
+duplicate_summary %>% filter(n_hs != 1) %>% summarise(n = sum(n)) / sum(FRP_sum$n_hotspots_total) * 100
+
+# map duplicates
+duplicates <- map_duplicate_locations(frpsum_list)
+duplicates %>% ggplot(aes(lon, lat)) + 
+  geom_hex(bins = 50) + 
+  scale_fill_gradient2(midpoint = 500,
+                       high = scales::muted("darkred"), 
+                       low = scales::muted("steelblue"))
 
 # calculate percentiles of FRP_sum
 percentiles <- data.frame(FRP_sum = FRP_sum$frp_sum_vec) %>%
@@ -186,6 +280,19 @@ FRP_sum_all <- FRP_sum$largest_events %>%
 
 # report how many extreme events?
 nrow(FRP_sum_all)
+
+# how many events were in the same cell in successive days
+sameCell <- FRP_sum_all %>%
+  mutate(date_ = as.Date(date_)) %>%
+  arrange(date_) %>%
+  group_by(ID) %>%
+  arrange(ID, date_) %>%
+  mutate(n_hs_in_cell = n(),
+         dayDiff = as.numeric(difftime(date_, lag(date_), units = "days")),
+         dayDiff = ifelse(is.na(dayDiff), 0, dayDiff))
+length(unique(sameCell$ID)) # number of cells containing an extreme event
+sameCell %>% filter(n_hs_in_cell > 1) %>% nrow() # unique cells containing multiple extreme events
+nrow(sameCell %>% filter(n_hs_in_cell > 1, dayDiff %in% c(1:7))) / nrow(FRP_sum_all) # proportion of extreme events occurring in the same cell in 7 day period
 
 # calculate annual number of extreme events
 FRP_sum_count <- FRP_sum_all %>%
@@ -221,7 +328,7 @@ summary(frpCount_gam1)
 FRP_sum_count <- predict_fun(mod = frpCount_gam1, dat = FRP_sum_count)
 
 # report model-estimated change in frequency from 2001 to 2023
-FRP_sum_count[FRP_sum_count$year == 2023,]$fit.exp / FRP_sum_count[FRP_sum_count$year == 2001,]$fit.exp
+FRP_sum_count[FRP_sum_count$year == 2023,]$fit.exp / FRP_sum_count[FRP_sum_count$year == min(FRP_sum_count$year),]$fit.exp
 
 # plot time series of count of extreme events, 
 plot_frp <- ggplot(FRP_sum_count, aes(year, tot)) +
@@ -273,7 +380,7 @@ summary(frp_magnitude_gam1)
 FRP_sum_yearly_mean <- predict_fun(mod = frp_magnitude_gam1, dat = FRP_sum_yearly_mean, logBackTrans = F)
 
 # change in magnitude
-FRP_sum_yearly_mean[FRP_sum_yearly_mean$year == 2023,]$fit / FRP_sum_yearly_mean[FRP_sum_yearly_mean$year == 2001,]$fit
+FRP_sum_yearly_mean[FRP_sum_yearly_mean$year == 2023,]$fit / FRP_sum_yearly_mean[FRP_sum_yearly_mean$year == 2003,]$fit
 
 # plot using mean of those 20 obs per year
 plot_topFRPeventsYearly_meanPoints <- ggplot(FRP_sum_yearly_mean, aes(year, FRP_sum)) +
@@ -352,7 +459,7 @@ multiPlot <- plot_grid(hottestFiresMap,
                        labels = c("(a)", ""), label_fontface = "plain", label_size = 12) +
   draw_label(paste("Frequency of ΣFRP ≥ ", p_thresh*100, "th percentile", sep = ""), x = 0.34, y = 0.42)
 
-#jpeg("C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/Global FRP/Analysis/map_frp_sum_realm.jpg",width=9,height=7, units = "in", res = 1000)
+#jpeg("C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/Global FRP/Analysis/map_frp_sum_realm_20240301.jpg",width=9,height=7, units = "in", res = 1000)
 multiPlot
 dev.off()
 
@@ -375,40 +482,6 @@ dev.off()
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### 
 # 5. Ratio of extreme events in biomes and realms ----
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### 
-
-### ### ### ### ### ### ###  
-# BIOMES
-### ### ### ### ### ### ### 
-
-# create data frame to insert zeroes for a given year when no major events occurred in a biome
-biome_year_zeroes <- expand_grid(BIOME_NAME = unique(grid_frp1$BIOME_NAME),  
-                                 year = sort(unique(grid_frp1$year)),
-                                 n = 0)
-
-# summarise proportion of events occurring in each biome
-grid_frp1_summary <- grid_frp1 %>% data.frame() %>%
-  group_by(BIOME_NAME) %>%
-  summarise(n = n(), area = as.numeric(mean(area_biome))) %>%
-  filter(!is.na(BIOME_NAME)) %>%
-  mutate(n_prop = n/sum(n), area_prop = area/sum(area, na.rm = T),
-         events_to_area = n_prop/area_prop) %>%
-  arrange(events_to_area) %>%
-  mutate(BIOME_NAME = factor(BIOME_NAME, levels = .$BIOME_NAME),
-         events_to_area_cat = ifelse(events_to_area > 1, "high", "low")) 
-
-# plot events to area ratio
-p_ratio <- ggplot(grid_frp1_summary, aes(events_to_area, BIOME_NAME, fill = events_to_area_cat)) +
-  geom_bar(stat = "identity", alpha = 0.5) +
-  geom_vline(xintercept = 1, linetype = "dashed") +
-  labs(x = "Ratio of major ΣFRP events to biome area", y = element_blank()) +
-  geom_text(aes(label = paste("N =", n)), nudge_x = c(rep(1.4, 10), rep(0.65, 3))) +
-  theme(panel.grid.major = element_blank(), axis.text.y = element_text(size = 11)) +
-  lims(x = c(0,max(grid_frp1_summary$events_to_area) + 1)) + 
-  scale_fill_manual(values = c("darkorange", "grey50")) +
-  theme(legend.position = "none")+
-  scale_y_discrete(labels = label_wrap_gen(width = 34)) 
-p_ratio
-
 
 ### ### ### ### ### ### ###  
 # REALMS
@@ -445,42 +518,41 @@ p_ratio_realm
 
 
 ### ### ### ### ### ### ###  
-# CONTINENTS
-### ### ### ### ### ### ###  
+# BIOMES
+### ### ### ### ### ### ### 
 
-# create data frame to insert zeroes for a given year when no major events occurred in a continent
-continent_year_zeroes <- expand_grid(continent = unique(grid_frp1$continent),  
-                                     year = sort(unique(grid_frp1$year)),
-                                     n = 0)
+# create data frame to insert zeroes for a given year when no major events occurred in a biome
+biome_year_zeroes <- expand_grid(BIOME_NAME = unique(grid_frp1$BIOME_NAME),  
+                                 year = sort(unique(grid_frp1$year)),
+                                 n = 0)
 
 # summarise proportion of events occurring in each biome
-frp_continent_summary <- grid_frp1 %>% data.frame() %>%
-  group_by(continent) %>%
-  summarise(n = n(), area = as.numeric(mean(area_continent))) %>%
-  filter(!is.na(continent)) %>%
+grid_frp1_summary <- grid_frp1 %>% data.frame() %>%
+  group_by(BIOME_NAME) %>%
+  summarise(n = n(), area = as.numeric(mean(area_biome))) %>%
+  filter(!is.na(BIOME_NAME)) %>%
   mutate(n_prop = n/sum(n), area_prop = area/sum(area, na.rm = T),
          events_to_area = n_prop/area_prop) %>%
   arrange(events_to_area) %>%
-  mutate(continent = ifelse(continent == "Oceania", "Australia/Oceania", continent)) %>%
-  mutate(continent = factor(continent, levels = .$continent),
-         events_to_area_cat = ifelse(events_to_area > 1, "high", "low"))
+  mutate(BIOME_NAME = factor(BIOME_NAME, levels = .$BIOME_NAME),
+         events_to_area_cat = ifelse(events_to_area > 1, "high", "low")) 
 
 # plot events to area ratio
-p_ratio_continent <- ggplot(frp_continent_summary, aes(events_to_area, continent, fill = events_to_area_cat)) +
+p_ratio <- ggplot(grid_frp1_summary, aes(events_to_area, BIOME_NAME, fill = events_to_area_cat)) +
   geom_bar(stat = "identity", alpha = 0.5) +
   geom_vline(xintercept = 1, linetype = "dashed") +
-  labs(x = "Ratio of major ΣFRP events to continent area", y = element_blank()) +
-  geom_text(aes(label = paste("N =", n)), nudge_x = c(rep(0.3, 3), rep(0.3, 3))) +
+  labs(x = "Ratio of major ΣFRP events to biome area", y = element_blank()) +
+  geom_text(aes(label = paste("N =", n)), nudge_x = c(rep(1.4, 10), rep(0.65, 3))) +
   theme(panel.grid.major = element_blank(), axis.text.y = element_text(size = 11)) +
-  lims(x = c(0,max(frp_continent_summary$events_to_area) + 1)) + 
+  lims(x = c(0,max(grid_frp1_summary$events_to_area) + 1)) + 
   scale_fill_manual(values = c("darkorange", "grey50")) +
   theme(legend.position = "none")+
-  scale_y_discrete(labels = label_wrap_gen(width = 30)) 
-p_ratio_continent
+  scale_y_discrete(labels = label_wrap_gen(width = 34)) 
+p_ratio
 
 
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### 
-# 6. Temporal trends amomng key biomes ----
+# 6. Temporal trends among key biomes ----
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### 
 
 # plot trends among biomes that are most affected by intense fires
@@ -545,8 +617,8 @@ for(i in names(mod_list)) {
 predictions <- bind_rows(predictions) %>% left_join(coef_df) %>%  mutate(BIOME_NAME = factor(BIOME_NAME, levels = coef_df$BIOME_NAME))
 
 # percentage change
-predictions[predictions$year == 2023 & predictions$BIOME_NAME == "Temperate Conifer Forests",]$fit.exp / predictions[predictions$year == 2001 & predictions$BIOME_NAME == "Temperate Conifer Forests",]$fit.exp
-predictions[predictions$year == 2023 & predictions$BIOME_NAME == "Boreal Forests/Taiga",]$fit.exp / predictions[predictions$year == 2001 & predictions$BIOME_NAME == "Boreal Forests/Taiga",]$fit.exp
+predictions[predictions$year == 2023 & predictions$BIOME_NAME == "Temperate Conifer Forests",]$fit.exp / predictions[predictions$year == 2003 & predictions$BIOME_NAME == "Temperate Conifer Forests",]$fit.exp
+predictions[predictions$year == 2023 & predictions$BIOME_NAME == "Boreal Forests/Taiga",]$fit.exp / predictions[predictions$year == 2003 & predictions$BIOME_NAME == "Boreal Forests/Taiga",]$fit.exp
 
 # get max value for axis
 maxNonBoreal <- max(
@@ -581,29 +653,28 @@ p_trend_biome1 <- p_trend_biome +
 p_trend_biome2 <- p_trend_biome1 +  
   # label p values
   geom_text(data = coef_df %>% filter(BIOME_NAME %in% c("Boreal Forests/Taiga")), 
-            aes(x = 2001, y = 103, label = p_yr_txt), colour = "darkred", hjust = 0)  +
+            aes(x = 2003, y = 175, label = p_yr_txt), colour = "darkred", hjust = 0)  +
   geom_text(data = coef_df %>% filter(BIOME_NAME %in% c("Temperate Conifer Forests")), 
-            aes(x = 2001, y = 44, label = p_yr_txt), colour = "darkred", hjust = 0) +
+            aes(x = 2003, y = 100, label = p_yr_txt), colour = "darkred", hjust = 0) +
   geom_text(data = coef_df %>% filter(!BIOME_NAME %in% c("Temperate Conifer Forests", "Boreal Forests/Taiga")), 
-            aes(x = 2001, y = 44, label = p_yr_txt), colour = "steelblue4", hjust = 0) +
+            aes(x = 2003, y = 100, label = p_yr_txt), colour = "steelblue4", hjust = 0) +
   # label model formula
   geom_text(data = coef_df %>% filter(BIOME_NAME %in% c("Boreal Forests/Taiga")), 
-            aes(x = 2001, y = 117, label = lp), colour = "darkred", hjust = 0) +
+            aes(x = 2003, y = 210, label = lp), colour = "darkred", hjust = 0) +
   geom_text(data = coef_df %>% filter(BIOME_NAME %in% c("Temperate Conifer Forests")), 
-            aes(x = 2001, y = 50, label = lp), colour = "darkred", hjust = 0) +
+            aes(x = 2003, y = 120, label = lp), colour = "darkred", hjust = 0) +
   geom_text(data = coef_df %>% filter(!BIOME_NAME %in% c("Temperate Conifer Forests", "Boreal Forests/Taiga")), 
-          aes(x = 2001, y = 50, label = lp), colour = "steelblue4", hjust = 0)
+          aes(x = 2003, y = 120, label = lp), colour = "steelblue4", hjust = 0)
 p_trend_biome2
 
 # export multi panel plot
-#jpeg("C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/Global FRP/Analysis/frp_sum_biomes_realm_continent.jpg",width=12.5,height=8.5, units = "in", res = 1000)
+#jpeg("C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/Global FRP/Analysis/frp_sum_biomes_realm_continent_20240301.jpg",width=12.5,height=7, units = "in", res = 1000)
 plot_grid(
-  plot_grid(p_ratio_continent, NULL, p_ratio_realm, NULL, p_ratio, ncol = 1, rel_heights = c(0.4,0.05,0.4,0.05,1.2), axis = "lrtb", align = "v", labels = c("(a)","", "(b)", "", "(c)"), label_fontface = "plain", label_size = 12),
+  plot_grid(p_ratio_realm, NULL, p_ratio, ncol = 1, rel_heights = c(0.4,0.05,1), axis = "lrtb", align = "v", labels = c("(a)","", "(b)"), label_fontface = "plain", label_size = 12),
   p_trend_biome2, 
-  labels = c("","(d)"), label_fontface = "plain", label_size = 12,
+  labels = c("","(c)"), label_fontface = "plain", label_size = 12,
   rel_widths = c(1.1,1), nrow = 1) 
 dev.off()
-
 
 
 
@@ -611,50 +682,67 @@ dev.off()
 # 7. Supplementary Analysis: Compare Terra with Terra + Aqua ----
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### 
 
-# load FRP_sum events calculated using Terra + Aqua
-wd_terra_aqua <- "C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/MODIS_global/hotspotFRPSum_20240116_TERRAandAQUA"; setwd(wd_terra_aqua)
-frpsum_list_terraAndAqua <- list.files(pattern = "rds")
-FRP_sum_TA <- read_summarised_frp(fileList = frpsum_list_terraAndAqua, n = 100000)
+#summarise_hotspots_annually(yearRange = 2001:2023, satellite = c("T"), outFolder = "hotspotFRPSum_20240229_TERRA")
+#summarise_hotspots_annually(yearRange = 2003:2023, satellite = c("A"), outFolder = "hotspotFRPSum_20240229_AQUA")
+
+# load FRP_sum events calculated using Terra + Aqua separately
+wd_terra <- "C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/MODIS_global/hotspotFRPSum_20240229_TERRA"; setwd(wd_terra)
+frpsum_list_terra <- list.files(pattern = "rds")
+FRP_sum_T <- read_summarised_frp(fileList = frpsum_list_terra, n = 100000)
+
+wd_aqua <- "C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/MODIS_global/hotspotFRPSum_20240229_AQUA"; setwd(wd_aqua)
+frpsum_list_aqua <- list.files(pattern = "rds")
+FRP_sum_A <- read_summarised_frp(fileList = frpsum_list_aqua, n = 100000)
 
 # calculate percentiles of FRP_sum
-percentiles_TA <- data.frame(FRP_sum = FRP_sum_TA$frp_sum_vec) %>%
+percentiles_T <- data.frame(FRP_sum = FRP_sum_T$frp_sum_vec) %>%
   filter(FRP_sum > 0) %>%
   mutate(FRP_sum_percentile = rank(FRP_sum)/length(FRP_sum))
-percentile_TA_threshold <- percentiles_TA %>% arrange(desc(FRP_sum_percentile)) %>% slice(which.min(abs(FRP_sum_percentile - p_thresh)))
+percentile_T_threshold <- percentiles_T %>% arrange(desc(FRP_sum_percentile)) %>% slice(which.min(abs(FRP_sum_percentile - p_thresh)))
+
+percentiles_A <- data.frame(FRP_sum = FRP_sum_A$frp_sum_vec) %>%
+  filter(FRP_sum > 0) %>%
+  mutate(FRP_sum_percentile = rank(FRP_sum)/length(FRP_sum))
+percentile_A_threshold <- percentiles_A %>% arrange(desc(FRP_sum_percentile)) %>% slice(which.min(abs(FRP_sum_percentile - p_thresh)))
 
 # major event count per year, then converted to proportion
-FRP_sum_TA_prop <- FRP_sum_TA$largest_events %>%
+FRP_sum_T_prop <- FRP_sum_T$largest_events %>%
   arrange(desc(FRP_sum)) %>%
-  filter(FRP_sum >= percentile_threshold$FRP_sum) %>%
+  filter(FRP_sum >= percentile_T_threshold$FRP_sum) %>%
   mutate(year = year(date_)) %>%
   group_by(year) %>%
   summarise(tot = n()) %>%
   mutate(prop = tot/sum(tot))
 
-FRP_sum_prop <- FRP_sum_count %>% 
+FRP_sum_A_prop <- FRP_sum_A$largest_events %>%
+  arrange(desc(FRP_sum)) %>%
+  filter(FRP_sum >= percentile_A_threshold$FRP_sum) %>%
+  mutate(year = year(date_)) %>%
+  group_by(year) %>%
+  summarise(tot = n()) %>%
   mutate(prop = tot/sum(tot))
 
 # graph data points each year (Fig S2a)
 plot_satellite_comparison <- ggplot() +
-  geom_line(data = FRP_sum_TA_prop, aes(year, prop), colour = "steelblue") +
-  geom_point(data = FRP_sum_TA_prop, aes(year, prop), colour = "steelblue") +
-  geom_line(data = FRP_sum_prop, aes(year, prop), colour = "darkred") +
-  geom_point(data = FRP_sum_prop, aes(year, prop), colour = "darkred") +
+  geom_line(data = FRP_sum_A_prop, aes(year, prop), colour = "steelblue") +
+  geom_point(data = FRP_sum_A_prop, aes(year, prop), colour = "steelblue") +
+  geom_line(data = FRP_sum_T_prop, aes(year, prop), colour = "darkred") +
+  geom_point(data = FRP_sum_T_prop, aes(year, prop), colour = "darkred") +
   labs(y = "Proportion")  +
-  geom_text(aes(label = "Terra only", x = 2001, y = 0.095), colour = "darkred", hjust = 0, size = 4.2) +
-  geom_text(aes(label = "Terra and Aqua", x = 2001, y = 0.08), colour = "steelblue", hjust = 0, size = 4.2)
+  geom_text(aes(label = "Terra", x = 2001, y = 0.095), colour = "darkred", hjust = 0, size = 4.2) +
+  geom_text(aes(label = "Aqua", x = 2001, y = 0.08), colour = "steelblue", hjust = 0, size = 4.2)
 plot_satellite_comparison
 
 # graph trend each year (Fig S2b)
 plot_satellite_comparison1 <- ggplot() +
-  geom_smooth(data = FRP_sum_TA_prop, aes(year, prop), method = "gam", formula = y ~ s(x, bs = "cs"), method.args = list(family = "quasipoisson"), colour = "steelblue", alpha = 0.1, fill = "steelblue") +
-  geom_smooth(data = FRP_sum_prop, aes(year, prop), method = "gam", formula = y ~ s(x, bs = "cs"), method.args = list(family = "quasipoisson"), colour = "darkred", alpha = 0.1, fill = "darkred") +
+  geom_smooth(data = FRP_sum_A_prop, aes(year, prop), method = "gam", formula = y ~ s(x, bs = "cs"), method.args = list(family = "quasipoisson"), colour = "steelblue", alpha = 0.2, fill = "steelblue") +
+  geom_smooth(data = FRP_sum_T_prop, aes(year, prop), method = "gam", formula = y ~ s(x, bs = "cs"), method.args = list(family = "quasipoisson"), colour = "darkred", alpha = 0.2, fill = "darkred") +
   labs(y = element_blank()) +
-  geom_text(aes(label = "Terra only", x = 2001, y = 0.095), colour = "darkred", hjust = 0, size = 4.2) +
-  geom_text(aes(label = "Terra and Aqua", x = 2001, y = 0.08), colour = "steelblue", hjust = 0, size = 4.2)
+  geom_text(aes(label = "Terra", x = 2001, y = 0.095), colour = "darkred", hjust = 0, size = 4.2) +
+  geom_text(aes(label = "Aqua", x = 2001, y = 0.08), colour = "steelblue", hjust = 0, size = 4.2)
 plot_satellite_comparison1
 
 # export multi panel figure (Fig S2)
-#jpeg("C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/Global FRP/Analysis/satellite_comparison.jpg",width=6,height=2.5, units = "in", res = 1000)
+#jpeg("C:/Users/cxc/OneDrive - University of Tasmania/UTAS/Fire/Global FRP/Analysis/satellite_comparison_20240304.jpg",width=6,height=2.5, units = "in", res = 1000)
 plot_grid(plot_satellite_comparison, plot_satellite_comparison1, align = "h", axis = "lrtb")
 dev.off()
